@@ -260,11 +260,17 @@ npm run benchmark 25
 ## Development
 
 ```bash
-npm run check              # typecheck + lint + unit tests
+npm run check              # typecheck + lint + format + unit tests
 npm run test:coverage      # unit tests with coverage (no browser needed)
-npm run test:integration   # real-browser isolation test (needs Chromium)
+npm run test:integration   # gated real-Chromium tests: isolation + deterministic, offline e2e
+                           #   journeys through the MCP server (needs Chromium). Add
+                           #   PW_HEADLESS=false to watch the parallel, isolated windows.
 npm run build              # tsup -> dist/ (ESM + d.ts)
 ```
+
+Test tiers: fast unit tests (the merge gate, no browser) → deterministic real-Chromium integration
+and several end-to-end journeys through the MCP server against a local styled app (gated by
+`RUN_INTEGRATION=1`, also run in CI).
 
 See [`AGENTS.md`](./AGENTS.md) for the engineering conventions this repo is built to.
 

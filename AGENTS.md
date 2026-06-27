@@ -72,10 +72,15 @@ test/
   server.test.ts           in-memory MCP round-trip — wiring + error mapping + policy
   transport-http.test.ts   HTTP round-trip + per-client isolation (no Chromium)
   policy/*.test.ts errors.test.ts config.test.ts  pure-unit coverage
-  integration.test.ts      real-Chromium, gated by RUN_INTEGRATION=1 (incl. ref + image)
+  integration.test.ts      real-Chromium isolation, gated by RUN_INTEGRATION=1
+  e2e.test.ts              multiple deterministic journeys THROUGH the MCP server, RUN_INTEGRATION=1
+  fixtures/app.ts          styled multi-page app served in-process for the e2e (offline)
 scripts/
   benchmark.ts  demo.ts
 ```
+
+Test tiers: unit (the merge gate) → deterministic real-Chromium integration + e2e through the MCP
+server (gated by `RUN_INTEGRATION=1`, also run in CI).
 
 ## Definition of done
 

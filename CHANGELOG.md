@@ -27,3 +27,5 @@ Initial public release.
   eviction, request-body and connection caps in HTTP mode.
 - Typed error taxonomy (`SessionError` + machine-readable codes) surfaced in-band.
 - Configurable via `PW_*` environment variables; provenance-signed npm release workflow.
+- Test tiers: unit (merge gate); deterministic real-Chromium integration + an offline e2e flow
+  through the MCP server (`RUN_INTEGRATION=1`, also run in CI).
