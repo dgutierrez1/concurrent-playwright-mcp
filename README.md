@@ -105,6 +105,12 @@ Most clients accept an HTTP MCP URL directly; e.g.:
 }
 ```
 
+> **HTTP mode has no built-in authentication.** It binds `127.0.0.1` by default and rejects
+> mismatched `Host` headers (DNS-rebinding protection is on), so a local web page can't drive it.
+> To serve real remote clients, set `PW_HOST` and add the externally-visible host to
+> `PW_ALLOWED_HOSTS` (e.g. `PW_ALLOWED_HOSTS=mcp.example.com:3000`), and put it behind your own
+> authenticating proxy / network controls — anyone who can reach the port can drive a browser.
+
 ### The session-per-agent pattern
 
 The core idea: **each agent or task uses its own `sessionId`**. Create it once, then pass it to every
@@ -121,34 +127,101 @@ browser_save_storage_state { "sessionId": "userA", "path": "userA.json" }   # re
 browser_close_session   { "sessionId": "userA" }
 ```
 
+> Those `browser_… { … }` lines are **illustrative**, not text you type. The model emits a
+> structured tool call and the client routes it over MCP; you never hand-write tool calls.
+
+## How it works (integrating with an agent)
+
+Three actors are involved:
+
+- **Operator (you):** install the package + Chromium and add the config block above. That is the
+  entire human surface — you don't enumerate tools or write tool calls.
+- **MCP client / harness** (Claude Code, Claude Desktop, Cursor, …): spawns the server (stdio) or
+  connects to it (HTTP), performs the MCP handshake, calls `tools/list` to **discover the tools and
+  their schemas automatically**, and surfaces them — plus the server's built-in `instructions` — to
+  the model.
+- **LLM / agent:** drives the tools in a loop: allocate a `sessionId` → `browser_create_session` →
+  `browser_navigate` → `browser_snapshot` (read the page, get `ref`s) → act by `ref` → … →
+  `browser_close_session`.
+
+Configuration happens at **three layers**:
+
+| Layer                  | Set by   | Where                                                         | Examples                                                                                |
+| ---------------------- | -------- | ------------------------------------------------------------- | --------------------------------------------------------------------------------------- |
+| Server policy & limits | operator | `env` in the client config (stdio) or the server's env (HTTP) | `PW_HEADLESS`, `PW_MAX_SESSIONS`, `PW_ALLOWED_ORIGINS`, `PW_OUTPUT_DIR`, `PW_TRANSPORT` |
+| Per-session            | agent    | `browser_create_session` args                                 | `sessionId` (required), `viewport`, `storageStatePath`                                  |
+| Per-call               | agent    | each tool's args                                              | `url`, `ref` + `element`, `text`, `path`, …                                             |
+
+Security limits live **only** in the server layer — an agent can't widen them (it can't escape
+`PW_OUTPUT_DIR` or bypass `PW_ALLOWED_ORIGINS`). Per-call args are validated at the edge with
+defaults, so the agent can omit the optional ones.
+
 ## Tools
 
-Session lifecycle: `browser_create_session` (optionally seeded from a saved `storageStatePath`), `browser_list_sessions`, `browser_close_session`, `browser_save_storage_state`.
+The agent discovers these (with full JSON schemas) via `tools/list`; this reference is for human
+integrators. Optional params are marked `?`. Every tool takes `sessionId` except
+`browser_list_sessions`.
 
-Element actions take a `ref` (from `browser_snapshot`) plus an `element` description: `browser_click`, `browser_type`, `browser_hover`, `browser_select_option`, `browser_fill_form`, `browser_file_upload`, `browser_drag`.
+**Session lifecycle**
 
-Other per-session tools (all take a `sessionId`): `browser_navigate`, `browser_navigate_back`, `browser_press_key`, `browser_resize`, `browser_screenshot` (returns an image), `browser_snapshot`, `browser_evaluate`, `browser_wait_for`, `browser_console_messages`, `browser_network_requests`, `browser_handle_dialog`, `browser_tabs`.
+| Tool                         | Params (besides `sessionId`)     | Returns                            |
+| ---------------------------- | -------------------------------- | ---------------------------------- |
+| `browser_create_session`     | `viewport?`, `storageStatePath?` | confirmation                       |
+| `browser_list_sessions`      | — (takes no `sessionId`)         | JSON array of live session ids     |
+| `browser_close_session`      | —                                | confirmation                       |
+| `browser_save_storage_state` | `path`                           | path to saved cookies+localStorage |
+
+**Navigation & inspection**
+
+| Tool                       | Params (besides `sessionId`)                       | Returns                            |
+| -------------------------- | -------------------------------------------------- | ---------------------------------- |
+| `browser_navigate`         | `url`                                              | confirmation                       |
+| `browser_navigate_back`    | —                                                  | confirmation                       |
+| `browser_snapshot`         | —                                                  | accessibility YAML with `ref`s     |
+| `browser_screenshot`       | `fullPage?`, `path?`                               | PNG image (+ saved file if `path`) |
+| `browser_evaluate`         | `script`                                           | JSON-serialized result             |
+| `browser_wait_for`         | `selector`, `state?`, `timeout?`                   | confirmation                       |
+| `browser_press_key`        | `key`                                              | confirmation                       |
+| `browser_resize`           | `width`, `height`                                  | confirmation                       |
+| `browser_console_messages` | `onlyErrors?`                                      | JSON                               |
+| `browser_network_requests` | —                                                  | JSON                               |
+| `browser_handle_dialog`    | `accept`, `promptText?`                            | confirmation                       |
+| `browser_tabs`             | `action` (`list`/`new`/`close`/`select`), `index?` | confirmation / tab list            |
+
+**Element actions** — target by `ref` + `element` (a human description) from the latest `browser_snapshot`:
+
+| Tool                    | Params (besides `sessionId`)                               |
+| ----------------------- | ---------------------------------------------------------- |
+| `browser_click`         | `ref`, `element`                                           |
+| `browser_hover`         | `ref`, `element`                                           |
+| `browser_type`          | `ref`, `element`, `text`                                   |
+| `browser_select_option` | `ref`, `element`, `values`                                 |
+| `browser_file_upload`   | `ref`, `element`, `paths`                                  |
+| `browser_drag`          | `sourceRef`, `sourceElement`, `targetRef`, `targetElement` |
+| `browser_fill_form`     | `fields` — array of `{ ref, element, value }`              |
 
 ## Configuration (env vars)
 
 Invalid values (e.g. a negative `PW_MAX_SESSIONS`) are rejected with a warning on stderr and the
 default is used; the effective config is logged to stderr at startup.
 
-| Var                  | Default     | Meaning                                                     |
-| -------------------- | ----------- | ----------------------------------------------------------- |
-| `PW_HEADLESS`        | `true`      | `false` to show browser windows                             |
-| `PW_MAX_SESSIONS`    | `50`        | Hard cap on live sessions                                   |
-| `PW_MAX_TABS`        | `20`        | Hard cap on tabs per session                                |
-| `PW_MAX_CAPTURE`     | `1000`      | Max console/network entries retained per session            |
-| `PW_IDLE_TIMEOUT_MS` | `0` (off)   | Evict a session after this long with no use                 |
-| `PW_OUTPUT_DIR`      | `./output`  | Directory screenshots are written to (paths confined to it) |
-| `PW_UPLOAD_DIR`      | unset (any) | Confine `browser_file_upload` paths to this directory       |
-| `PW_ALLOWED_ORIGINS` | unset (any) | Comma-separated origin allowlist for navigation             |
-| `PW_ALLOW_FILE_URLS` | `false`     | Allow `file:`/`data:` navigation                            |
-| `PW_EXECUTABLE_PATH` | unset       | Use a specific Chromium build                               |
-| `PW_TRANSPORT`       | `stdio`     | `http` to serve over Streamable HTTP                        |
-| `PW_HOST`            | `127.0.0.1` | Host to bind in `http` mode                                 |
-| `PW_PORT`            | `3000`      | Port to bind in `http` mode                                 |
+| Var                    | Default     | Meaning                                                     |
+| ---------------------- | ----------- | ----------------------------------------------------------- |
+| `PW_HEADLESS`          | `true`      | `false` to show browser windows                             |
+| `PW_MAX_SESSIONS`      | `50`        | Hard cap on live sessions                                   |
+| `PW_MAX_TABS`          | `20`        | Hard cap on tabs per session                                |
+| `PW_MAX_CAPTURE`       | `1000`      | Max console/network entries retained per session            |
+| `PW_IDLE_TIMEOUT_MS`   | `0` (off)   | Evict a session after this long with no use                 |
+| `PW_OUTPUT_DIR`        | `./output`  | Directory screenshots are written to (paths confined to it) |
+| `PW_UPLOAD_DIR`        | unset (any) | Confine `browser_file_upload` paths to this directory       |
+| `PW_ALLOWED_ORIGINS`   | unset (any) | Comma-separated origin allowlist for navigation             |
+| `PW_ALLOW_FILE_URLS`   | `false`     | Allow `file:`/`data:` navigation                            |
+| `PW_ACTION_TIMEOUT_MS` | `15000`     | Per-action timeout for element interactions                 |
+| `PW_EXECUTABLE_PATH`   | unset       | Use a specific Chromium build                               |
+| `PW_TRANSPORT`         | `stdio`     | `http` to serve over Streamable HTTP                        |
+| `PW_HOST`              | `127.0.0.1` | Host to bind in `http` mode                                 |
+| `PW_PORT`              | `3000`      | Port to bind in `http` mode                                 |
+| `PW_ALLOWED_HOSTS`     | unset       | Extra `Host` values accepted in `http` mode (see below)     |
 
 ## Security model
 
@@ -157,8 +230,9 @@ This server is **dual-use**: it hands an MCP client real control of a browser. T
 agent into calling these tools with attacker-chosen arguments). With that in mind:
 
 - **Navigation** (`browser_navigate`) blocks `file:` and `data:` URLs by default — the sharpest
-  local-file-read / SSRF vector. Set `PW_ALLOW_FILE_URLS=true` to allow them. Set
-  `PW_ALLOWED_ORIGINS` to restrict navigation to an allowlist of origins.
+  local-file-read / SSRF vector. Set `PW_ALLOW_FILE_URLS=true` to allow them. Note the default still
+  permits any `http(s)` URL, including internal services and cloud metadata (`169.254.169.254`); set
+  `PW_ALLOWED_ORIGINS` to restrict navigation to an allowlist of origins for any networked deployment.
 - **Screenshots and storage state** (`browser_screenshot` with a `path`, `browser_save_storage_state`,
   and `storageStatePath` on create) are confined to `PW_OUTPUT_DIR`; paths that try to escape it (via
   `..` or an absolute path) are rejected. Storage-state files contain cookies and may hold auth
@@ -167,8 +241,10 @@ agent into calling these tools with attacker-chosen arguments). With that in min
   `PW_UPLOAD_DIR` to confine uploads to one directory.
 - **`browser_evaluate`** runs arbitrary JavaScript in the page (sandboxed to the page, not Node). It
   is a privileged capability; the navigation allowlist is the most effective containment.
-- **HTTP mode** binds `127.0.0.1` by default and gives each client an isolated session namespace;
-  put it behind your own auth/proxy before exposing it beyond localhost.
+- **HTTP mode** binds `127.0.0.1` by default, enables DNS-rebinding protection (rejects unexpected
+  `Host` headers), caps request body size and concurrent sessions, and gives each client an isolated
+  session namespace. It has **no authentication** — see the warning under "Over HTTP" before exposing
+  it beyond localhost.
 
 Errors are reported in-band (`isError`) with a stable `code` prefix (e.g. `NAVIGATION_BLOCKED`,
 `PATH_NOT_ALLOWED`, `SESSION_NOT_FOUND`), never thrown across the JSON-RPC channel.

@@ -1,5 +1,7 @@
-import { chromiumLauncher } from "../src/playwright-launcher.js";
-import { SessionManager } from "../src/session-manager.js";
+import { writeFile } from "node:fs/promises";
+import { BrowserProvider } from "../src/browser-provider";
+import { chromiumLauncher } from "../src/playwright-launcher";
+import { SessionManager } from "../src/session-manager";
 
 /**
  * Demo: two agents, two isolated browsers, at the same time. One drives a
@@ -13,7 +15,8 @@ const headless = process.env.PW_HEADLESS !== "false";
 const target = process.env.DEMO_URL ?? "https://example.com";
 
 async function main(): Promise<void> {
-  const manager = new SessionManager(chromiumLauncher({ headless }));
+  const provider = new BrowserProvider(chromiumLauncher({ headless }));
+  const manager = new SessionManager(provider);
 
   console.log(`Opening two isolated sessions against ${target} ...`);
   await Promise.all([
@@ -34,13 +37,18 @@ async function main(): Promise<void> {
   console.log(`desktop page title: ${JSON.stringify(desktopTitle)}`);
   console.log(`mobile innerWidth:  ${JSON.stringify(mobileWidth)}`);
 
+  const [desktopPng, mobilePng] = await Promise.all([
+    manager.get("desktop").screenshot(false),
+    manager.get("mobile").screenshot(false),
+  ]);
   await Promise.all([
-    manager.get("desktop").screenshot("demo-desktop.png"),
-    manager.get("mobile").screenshot("demo-mobile.png"),
+    writeFile("demo-desktop.png", desktopPng),
+    writeFile("demo-mobile.png", mobilePng),
   ]);
   console.log("Saved demo-desktop.png and demo-mobile.png.");
 
   await manager.closeAll();
+  await provider.close();
   console.log("Closed all sessions.");
 }
 

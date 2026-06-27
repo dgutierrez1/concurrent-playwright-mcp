@@ -1,6 +1,6 @@
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { loadConfig } from "../src/config.js";
+import { loadConfig } from "../src/config";
 
 /** Silence (and capture) the stderr warnings loadConfig emits for bad input. */
 function muteWarnings() {
@@ -19,12 +19,37 @@ describe("loadConfig", () => {
       idleTimeoutMs: 0,
       maxTabs: 20,
       maxCaptureEntries: 1000,
+      actionTimeoutMs: 15000,
     });
     expect(config.launch.headless).toBe(true);
     expect(config.security.allowFileUrls).toBe(false);
     expect(config.security.allowedOrigins).toBeUndefined();
     expect(config.security.uploadDir).toBeUndefined();
     expect(config.security.outputDir).toBe(path.resolve("output"));
+    expect(config.transport).toEqual({ mode: "stdio", host: "127.0.0.1", port: 3000 });
+  });
+
+  it("parses the http transport vars", () => {
+    const config = loadConfig({
+      PW_TRANSPORT: "http",
+      PW_HOST: "0.0.0.0",
+      PW_PORT: "8080",
+      PW_ALLOWED_HOSTS: "example.com:8080, app.internal:8080",
+      PW_ACTION_TIMEOUT_MS: "5000",
+    });
+    expect(config.transport).toEqual({
+      mode: "http",
+      host: "0.0.0.0",
+      port: 8080,
+      allowedHosts: ["example.com:8080", "app.internal:8080"],
+    });
+    expect(config.manager.actionTimeoutMs).toBe(5000);
+  });
+
+  it("warns on an unrecognized transport and falls back to stdio", () => {
+    const warn = muteWarnings();
+    expect(loadConfig({ PW_TRANSPORT: "carrier-pigeon" }).transport.mode).toBe("stdio");
+    expect(warn).toHaveBeenCalled();
   });
 
   it("parses valid values", () => {

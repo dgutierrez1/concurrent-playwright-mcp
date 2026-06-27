@@ -1,5 +1,5 @@
-import type { BrowserContext, Page } from "playwright";
-import { TabLimitError, TabOutOfRangeError } from "./errors.js";
+import type { BrowserContext, Locator, Page } from "playwright";
+import { ElementRefError, TabLimitError, TabOutOfRangeError } from "./errors";
 
 /** A console message captured from a page within a session. */
 export interface ConsoleMessage {
@@ -12,7 +12,7 @@ export interface ConsoleMessage {
 export interface NetworkResponse {
   url: string;
   method: string;
-  status?: number;
+  status: number;
   timestamp: number;
 }
 
@@ -26,16 +26,34 @@ export interface TabInfo {
 /** States a selector can be waited for, mirroring Playwright's own set. */
 export type WaitForState = "attached" | "detached" | "visible" | "hidden";
 
-/** Tuning knobs for a single session's resource bounds. */
+/**
+ * An element targeted by a `ref` from the latest {@link BrowserSession.snapshot}.
+ * `element` is a human-readable description, used only for error messages.
+ */
+export interface ElementTarget {
+  ref: string;
+  element: string;
+}
+
+/** One field to fill, targeted by ref. */
+export interface FormField extends ElementTarget {
+  value: string;
+}
+
+/** Tuning knobs for a single session's resource bounds and timing. */
 export interface BrowserSessionOptions {
   /** Hard cap on tabs in this session; opening past it throws. */
   maxTabs?: number;
   /** Max console/network entries retained (ring buffer, drop-oldest). */
   maxCaptureEntries?: number;
+  /** Per-action timeout (ms) for element interactions. */
+  actionTimeoutMs?: number;
 }
 
-const DEFAULT_MAX_TABS = 20;
-const DEFAULT_MAX_CAPTURE_ENTRIES = 1000;
+/** Defaults for a session; the single source of truth, re-exported by the manager. */
+export const DEFAULT_MAX_TABS = 20;
+export const DEFAULT_MAX_CAPTURE_ENTRIES = 1000;
+export const DEFAULT_ACTION_TIMEOUT_MS = 15_000;
 
 /** A pending decision for the next dialog, set by {@link BrowserSession.handleDialog}. */
 interface DialogDecision {
@@ -47,8 +65,12 @@ interface DialogDecision {
  * One isolated browser session: a single Playwright {@link BrowserContext}
  * plus the active page and the console/network captured against it.
  *
+ * Elements are targeted by `ref` ids from {@link snapshot} (the accessibility
+ * tree), resolved through Playwright's `aria-ref=` engine — the same model the
+ * official Playwright MCP uses, more reliable than raw CSS for agents.
+ *
  * The session owns no cross-session state, which is what makes the isolation
- * guarantee in {@link import("./session-manager.js").SessionManager} hold: two
+ * guarantee in {@link import("./session-manager").SessionManager} hold: two
  * sessions never share a context, cookies, storage, or capture buffers.
  *
  * Methods return typed data, not transport-shaped payloads. Formatting results
@@ -58,6 +80,7 @@ export class BrowserSession {
   readonly #context: BrowserContext;
   readonly #maxTabs: number;
   readonly #maxCaptureEntries: number;
+  readonly #actionTimeoutMs: number;
   #activePage: Page | null = null;
   readonly #consoleMessages: ConsoleMessage[] = [];
   readonly #networkResponses: NetworkResponse[] = [];
@@ -70,6 +93,7 @@ export class BrowserSession {
     this.#context = context;
     this.#maxTabs = options.maxTabs ?? DEFAULT_MAX_TABS;
     this.#maxCaptureEntries = options.maxCaptureEntries ?? DEFAULT_MAX_CAPTURE_ENTRIES;
+    this.#actionTimeoutMs = options.actionTimeoutMs ?? DEFAULT_ACTION_TIMEOUT_MS;
     // Wire capture for every page the context ever owns — new tabs, popups
     // (window.open / target=_blank), and the lazily-created first page alike.
     this.#context.on("page", (page) => {
@@ -139,6 +163,21 @@ export class BrowserSession {
     }
   }
 
+  /**
+   * Resolve a snapshot `ref` to a locator and run `act`. A missing/stale ref is
+   * detected up front (the `aria-ref=` engine matches zero elements) and turned
+   * into a clear {@link ElementRefError} instead of waiting out the action
+   * timeout — so a real action failure (e.g. a disabled element) surfaces as its
+   * own Playwright error rather than being mislabeled as a bad ref.
+   */
+  async #onRef<T>(target: ElementTarget, act: (locator: Locator) => Promise<T>): Promise<T> {
+    const locator = (await this.page()).locator(`aria-ref=${target.ref}`);
+    if ((await locator.count()) === 0) {
+      throw new ElementRefError(target.ref, target.element);
+    }
+    return act(locator);
+  }
+
   async navigate(url: string): Promise<void> {
     await (await this.page()).goto(url);
   }
@@ -148,68 +187,80 @@ export class BrowserSession {
     return (await (await this.page()).goBack()) !== null;
   }
 
-  async click(selector: string): Promise<void> {
-    await (await this.page()).click(selector);
+  async click(target: ElementTarget): Promise<void> {
+    await this.#onRef(target, (locator) => locator.click({ timeout: this.#actionTimeoutMs }));
   }
 
-  async type(selector: string, text: string): Promise<void> {
-    await (await this.page()).fill(selector, text);
+  async type(target: ElementTarget, text: string): Promise<void> {
+    await this.#onRef(target, (locator) => locator.fill(text, { timeout: this.#actionTimeoutMs }));
   }
 
-  async hover(selector: string): Promise<void> {
-    await (await this.page()).hover(selector);
+  async hover(target: ElementTarget): Promise<void> {
+    await this.#onRef(target, (locator) => locator.hover({ timeout: this.#actionTimeoutMs }));
   }
 
   async pressKey(key: string): Promise<void> {
     await (await this.page()).keyboard.press(key);
   }
 
-  async selectOption(selector: string, values: string[]): Promise<string[]> {
-    return (await this.page()).selectOption(selector, values);
+  async selectOption(target: ElementTarget, values: string[]): Promise<string[]> {
+    return this.#onRef(target, (locator) =>
+      locator.selectOption(values, { timeout: this.#actionTimeoutMs }),
+    );
   }
 
-  async fillForm(fields: readonly { selector: string; value: string }[]): Promise<void> {
-    const page = await this.page();
+  async fillForm(fields: readonly FormField[]): Promise<void> {
     for (const field of fields) {
-      await page.fill(field.selector, field.value);
+      await this.#onRef(field, (locator) =>
+        locator.fill(field.value, { timeout: this.#actionTimeoutMs }),
+      );
     }
   }
 
-  async fileUpload(selector: string, paths: string[]): Promise<void> {
-    await (await this.page()).setInputFiles(selector, paths);
+  async fileUpload(target: ElementTarget, paths: string[]): Promise<void> {
+    await this.#onRef(target, (locator) =>
+      locator.setInputFiles(paths, { timeout: this.#actionTimeoutMs }),
+    );
   }
 
-  async drag(sourceSelector: string, targetSelector: string): Promise<void> {
-    await (await this.page()).dragAndDrop(sourceSelector, targetSelector);
+  async drag(source: ElementTarget, dest: ElementTarget): Promise<void> {
+    const page = await this.page();
+    const from = page.locator(`aria-ref=${source.ref}`);
+    const to = page.locator(`aria-ref=${dest.ref}`);
+    // Fail fast on whichever ref is stale, so the error names the right element.
+    if ((await from.count()) === 0) {
+      throw new ElementRefError(source.ref, source.element);
+    }
+    if ((await to.count()) === 0) {
+      throw new ElementRefError(dest.ref, dest.element);
+    }
+    await from.dragTo(to, { timeout: this.#actionTimeoutMs });
   }
 
   async resize(width: number, height: number): Promise<void> {
     await (await this.page()).setViewportSize({ width, height });
   }
 
-  async screenshot(path: string, fullPage = false): Promise<void> {
-    await (await this.page()).screenshot({ path, fullPage });
+  /** Capture a PNG of the active page and return the bytes. */
+  async screenshot(fullPage: boolean): Promise<Buffer> {
+    return (await this.page()).screenshot({ fullPage });
   }
 
-  /** ARIA accessibility snapshot of the active page (YAML), for agent grounding. */
+  /** Accessibility snapshot of the active page (YAML with element refs). */
   async snapshot(): Promise<string> {
-    return (await this.page()).locator("body").ariaSnapshot();
+    return (await this.page()).locator("body").ariaSnapshot({ mode: "ai" });
   }
 
   async evaluate(script: string): Promise<unknown> {
     return (await this.page()).evaluate(script);
   }
 
-  async waitFor(
-    selector: string,
-    state: WaitForState = "visible",
-    timeoutMs = 30_000,
-  ): Promise<void> {
+  async waitFor(selector: string, state: WaitForState, timeoutMs: number): Promise<void> {
     await (await this.page()).waitForSelector(selector, { state, timeout: timeoutMs });
   }
 
   /** Console messages captured so far, optionally filtered to errors only. */
-  consoleMessages(onlyErrors = false): ConsoleMessage[] {
+  consoleMessages(onlyErrors: boolean): ConsoleMessage[] {
     if (!onlyErrors) {
       return [...this.#consoleMessages];
     }
@@ -219,6 +270,11 @@ export class BrowserSession {
   /** Network responses captured so far. */
   networkResponses(): NetworkResponse[] {
     return [...this.#networkResponses];
+  }
+
+  /** Write this session's cookies + localStorage to a Playwright storageState file. */
+  async saveStorageState(path: string): Promise<void> {
+    await this.#context.storageState({ path });
   }
 
   /**

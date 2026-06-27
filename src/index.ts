@@ -4,13 +4,12 @@ export {
   DEFAULT_MAX_SESSIONS,
   DEFAULT_MAX_TABS,
   DEFAULT_MAX_CAPTURE_ENTRIES,
-} from "./session-manager.js";
-export type {
-  BrowserLauncher,
-  CreateSessionOptions,
-  SessionManagerOptions,
-  Viewport,
-} from "./session-manager.js";
+  DEFAULT_ACTION_TIMEOUT_MS,
+} from "./session-manager";
+export type { CreateSessionOptions, SessionManagerOptions, Viewport } from "./session-manager";
+
+export { BrowserProvider } from "./browser-provider";
+export type { BrowserLauncher } from "./browser-provider";
 
 export {
   SessionError,
@@ -20,28 +19,31 @@ export {
   TabLimitError,
   TabOutOfRangeError,
   InvalidArgumentError,
+  ElementRefError,
   NavigationBlockedError,
   PathNotAllowedError,
-} from "./errors.js";
-export type { SessionErrorCode } from "./errors.js";
+} from "./errors";
+export type { SessionErrorCode } from "./errors";
 
-export { BrowserSession } from "./session.js";
+export { BrowserSession } from "./session";
 export type {
   BrowserSessionOptions,
   ConsoleMessage,
+  ElementTarget,
+  FormField,
   NetworkResponse,
   TabInfo,
   WaitForState,
-} from "./session.js";
+} from "./session";
 
-export { assertUrlAllowed, resolveWithinDir } from "./security.js";
-export type { UrlPolicy } from "./security.js";
+export { assertUrlAllowed } from "./policy/url-policy";
+export type { UrlPolicy } from "./policy/url-policy";
+export { resolveWithinDir } from "./policy/path-policy";
 
-export { chromiumLauncher } from "./playwright-launcher.js";
-export type { LaunchOptions } from "./playwright-launcher.js";
+export { chromiumLauncher } from "./playwright-launcher";
+export type { LaunchOptions } from "./playwright-launcher";
 
-export { createServer } from "./server.js";
-export type { SecurityConfig } from "./server.js";
+export { createServer } from "./server";
 
-export { loadConfig, describeConfig } from "./config.js";
-export type { AppConfig, ManagerConfig } from "./config.js";
+export { loadConfig, describeConfig, DEFAULT_SECURITY } from "./config";
+export type { AppConfig, ManagerConfig, TransportConfig, SecurityConfig } from "./config";

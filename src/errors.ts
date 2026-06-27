@@ -13,6 +13,7 @@ export type SessionErrorCode =
   | "TAB_LIMIT"
   | "TAB_OUT_OF_RANGE"
   | "INVALID_ARGUMENT"
+  | "ELEMENT_REF_INVALID"
   | "NAVIGATION_BLOCKED"
   | "PATH_NOT_ALLOWED";
 
@@ -59,7 +60,9 @@ export class SessionLimitError extends SessionError {
 export class TabLimitError extends SessionError {
   readonly code = "TAB_LIMIT";
   constructor(readonly limit: number) {
-    super(`Tab limit reached (${String(limit)}) for this session. Close a tab before opening another.`);
+    super(
+      `Tab limit reached (${String(limit)}) for this session. Close a tab before opening another.`,
+    );
   }
 }
 
@@ -77,6 +80,20 @@ export class TabOutOfRangeError extends SessionError {
 /** Raised when a tool argument is missing or malformed beyond what the schema catches. */
 export class InvalidArgumentError extends SessionError {
   readonly code = "INVALID_ARGUMENT";
+}
+
+/** Raised when an element `ref` does not resolve in the current page snapshot. */
+export class ElementRefError extends SessionError {
+  readonly code = "ELEMENT_REF_INVALID";
+  constructor(
+    readonly ref: string,
+    readonly element: string,
+  ) {
+    super(
+      `Element ref '${ref}' (${element}) did not resolve. ` +
+        `Take a fresh browser_snapshot and use a ref from it.`,
+    );
+  }
 }
 
 /** Raised when navigation is rejected by the configured URL policy. */

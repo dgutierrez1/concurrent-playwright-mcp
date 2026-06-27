@@ -1,35 +1,26 @@
-import path from "node:path";
+import { mkdir, writeFile } from "node:fs/promises";
+import { dirname } from "node:path";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 import pkg from "../package.json" with { type: "json" };
-import { InvalidArgumentError, SessionError } from "./errors.js";
-import { assertUrlAllowed, resolveWithinDir } from "./security.js";
-import { DEFAULT_VIEWPORT, type SessionManager } from "./session-manager.js";
-import type { WaitForState } from "./session.js";
+import { DEFAULT_SECURITY, type SecurityConfig } from "./config";
+import { InvalidArgumentError, SessionError } from "./errors";
+import { assertUrlAllowed } from "./policy/url-policy";
+import { resolveWithinDir } from "./policy/path-policy";
+import { DEFAULT_VIEWPORT, type SessionManager } from "./session-manager";
 
-/**
- * Security policy for the file/URL-touching tools, enforced here at the MCP edge
- * (the untrusted-input boundary) so the domain layer stays pure and reusable.
- */
-export interface SecurityConfig {
-  /** Directory screenshots are written into; paths are confined to it. */
-  outputDir: string;
-  /** If set, uploads are confined to this directory; otherwise unrestricted. */
-  uploadDir?: string;
-  /** If set and non-empty, navigation is restricted to these origins. */
-  allowedOrigins?: readonly string[];
-  /** Allow `file:`/`data:` navigation. Default false. */
-  allowFileUrls: boolean;
-}
+export type { SecurityConfig } from "./config";
 
-const DEFAULT_SECURITY: SecurityConfig = {
-  outputDir: path.resolve("output"),
-  allowFileUrls: false,
-};
+/** What a tool body returns: a plain string (→ text content) or a full result. */
+type ToolResult = string | CallToolResult;
 
 function ok(text: string): CallToolResult {
   return { content: [{ type: "text", text }] };
+}
+
+function errorResult(text: string): CallToolResult {
+  return { content: [{ type: "text", text }], isError: true };
 }
 
 /**
@@ -40,21 +31,27 @@ function ok(text: string): CallToolResult {
  */
 function fail(error: unknown): CallToolResult {
   if (error instanceof SessionError) {
-    return { content: [{ type: "text", text: `${error.code}: ${error.message}` }], isError: true };
+    return errorResult(`${error.code}: ${error.message}`);
   }
   const message = error instanceof Error ? error.message : String(error);
+  // Playwright's "executable doesn't exist" hint spans several lines; surface a
+  // single actionable line instead of just "Executable doesn't exist at ...".
+  if (message.includes("Executable doesn't exist") || message.includes("playwright install")) {
+    return errorResult("Chromium is not installed. Run: npx playwright install chromium");
+  }
   const firstLine = message.split("\n", 1)[0] ?? message;
-  return { content: [{ type: "text", text: `Error: ${firstLine}` }], isError: true };
+  return errorResult(`Error: ${firstLine}`);
 }
 
 /**
- * Run a tool body, converting its result string into MCP text content and any
- * thrown error into an `isError` result. Tool errors are reported in-band; we
- * never throw across the JSON-RPC boundary. The body may be sync or async.
+ * Run a tool body, normalizing its result into MCP content and any thrown error
+ * into an `isError` result. Tool errors are reported in-band; we never throw
+ * across the JSON-RPC boundary.
  */
-async function run(body: () => string | Promise<string>): Promise<CallToolResult> {
+async function run(body: () => ToolResult | Promise<ToolResult>): Promise<CallToolResult> {
   try {
-    return ok(await body());
+    const result = await body();
+    return typeof result === "string" ? ok(result) : result;
   } catch (error) {
     return fail(error);
   }
@@ -69,13 +66,14 @@ function requireIndex(index: number | undefined, action: string): number {
 }
 
 const SESSION = z.string().min(1).describe("Id of the isolated browser session");
-const SELECTOR = z.string().describe("CSS selector or Playwright locator");
+const REF = z.string().min(1).describe("Element ref from the latest browser_snapshot (e.g. 'e12')");
+const ELEMENT = z.string().min(1).describe("Human description of the element (for logs/errors)");
 
 /**
  * Build the MCP server and register every browser tool against the given
- * {@link SessionManager}. Pure wiring: each handler is a thin delegate to the
- * session layer, so the testable logic lives in SessionManager/BrowserSession,
- * not here. File/URL-touching tools are guarded by {@link SecurityConfig}.
+ * {@link SessionManager}. Pure wiring: each handler validates input here (Zod,
+ * with defaults), then delegates to the session layer. File/URL-touching tools
+ * are guarded by {@link SecurityConfig}.
  */
 export function createServer(
   manager: SessionManager,
@@ -89,12 +87,32 @@ export function createServer(
     {
       instructions:
         "Browser automation with one isolated session per agent/task. Allocate a unique " +
-        "`sessionId` for your work, call browser_create_session first, then pass that " +
-        "`sessionId` to every other tool. Close it with browser_close_session when done.",
+        "`sessionId`, call browser_create_session first, then pass it to every other tool. " +
+        "Target elements by `ref` from browser_snapshot (not CSS). Close with " +
+        "browser_close_session when done.",
     },
   );
 
-  server.registerTool(
+  /**
+   * Register a tool whose body returns a string or a full result; errors are
+   * reported in-band by {@link run}. The callback is cast to the SDK's loosely
+   * typed handler shape — the generic `Shape` gives us precise `args` typing that
+   * the SDK's own generic does not preserve through this wrapper.
+   */
+  type RegisterArgs = Parameters<typeof server.registerTool>;
+  const tool = <Shape extends z.ZodRawShape>(
+    name: string,
+    config: { title: string; description: string; inputSchema: Shape },
+    body: (args: z.infer<z.ZodObject<Shape>>) => ToolResult | Promise<ToolResult>,
+  ): void => {
+    const handler = (args: z.infer<z.ZodObject<Shape>>): Promise<CallToolResult> =>
+      run(() => body(args));
+    server.registerTool(name, config as RegisterArgs[1], handler as unknown as RegisterArgs[2]);
+  };
+
+  // --- Session lifecycle -----------------------------------------------------
+
+  tool(
     "browser_create_session",
     {
       title: "Create session",
@@ -104,204 +122,228 @@ export function createServer(
         sessionId: SESSION,
         viewport: z
           .object({ width: z.number().int().positive(), height: z.number().int().positive() })
+          .default(DEFAULT_VIEWPORT)
+          .describe("Viewport size"),
+        storageStatePath: z
+          .string()
           .optional()
-          .describe(
-            `Viewport size; defaults to ${String(DEFAULT_VIEWPORT.width)}x${String(DEFAULT_VIEWPORT.height)}`,
-          ),
+          .describe("Storage-state JSON (within the output dir) to seed cookies/localStorage from"),
       },
     },
-    ({ sessionId, viewport }) =>
-      run(async () => {
-        await manager.createSession(sessionId, viewport ? { viewport } : {});
-        const size = viewport ?? DEFAULT_VIEWPORT;
-        return `Created session '${sessionId}' (${String(size.width)}x${String(size.height)}).`;
-      }),
+    async ({ sessionId, viewport, storageStatePath }) => {
+      const options =
+        storageStatePath === undefined
+          ? { viewport }
+          : { viewport, storageStatePath: resolveWithinDir(security.outputDir, storageStatePath) };
+      await manager.createSession(sessionId, options);
+      return `Created session '${sessionId}' (${String(viewport.width)}x${String(viewport.height)}).`;
+    },
   );
 
-  server.registerTool(
+  tool(
     "browser_list_sessions",
     {
       title: "List sessions",
       description: "List the ids of all live browser sessions.",
       inputSchema: {},
     },
-    () => run(() => JSON.stringify(manager.ids())),
+    () => JSON.stringify(manager.ids()),
   );
 
-  server.registerTool(
+  tool(
     "browser_close_session",
     {
       title: "Close session",
       description: "Close a session and release its browser context.",
       inputSchema: { sessionId: SESSION },
     },
-    ({ sessionId }) =>
-      run(async () => {
-        await manager.closeSession(sessionId);
-        return `Closed session '${sessionId}'.`;
-      }),
+    async ({ sessionId }) => {
+      await manager.closeSession(sessionId);
+      return `Closed session '${sessionId}'.`;
+    },
   );
 
-  server.registerTool(
+  tool(
+    "browser_save_storage_state",
+    {
+      title: "Save storage state",
+      description:
+        "Save the session's cookies + localStorage to a JSON file (within the output dir) for later reuse via browser_create_session.",
+      inputSchema: {
+        sessionId: SESSION,
+        path: z.string().describe("File path within the output dir"),
+      },
+    },
+    async ({ sessionId, path }) => {
+      const dest = resolveWithinDir(security.outputDir, path);
+      await mkdir(dirname(dest), { recursive: true });
+      await manager.get(sessionId).saveStorageState(dest);
+      return `Saved storage state to ${dest}.`;
+    },
+  );
+
+  // --- Navigation ------------------------------------------------------------
+
+  tool(
     "browser_navigate",
     {
       title: "Navigate",
       description: "Navigate the session's active page to a URL.",
       inputSchema: { sessionId: SESSION, url: z.string().describe("Destination URL") },
     },
-    ({ sessionId, url }) =>
-      run(async () => {
-        assertUrlAllowed(url, security);
-        await manager.get(sessionId).navigate(url);
-        return `Navigated to ${url} in session '${sessionId}'.`;
-      }),
+    async ({ sessionId, url }) => {
+      assertUrlAllowed(url, security);
+      await manager.get(sessionId).navigate(url);
+      return `Navigated to ${url} in session '${sessionId}'.`;
+    },
   );
 
-  server.registerTool(
+  tool(
     "browser_navigate_back",
     {
       title: "Navigate back",
       description: "Go back to the previous page in the session.",
       inputSchema: { sessionId: SESSION },
     },
-    ({ sessionId }) =>
-      run(async () => {
-        const moved = await manager.get(sessionId).navigateBack();
-        return moved
-          ? `Navigated back in session '${sessionId}'.`
-          : `No previous page in history for session '${sessionId}'.`;
-      }),
+    async ({ sessionId }) => {
+      const moved = await manager.get(sessionId).navigateBack();
+      return moved
+        ? `Navigated back in session '${sessionId}'.`
+        : `No previous page in history for session '${sessionId}'.`;
+    },
   );
 
-  server.registerTool(
+  // --- Element actions (ref-based) -------------------------------------------
+
+  tool(
     "browser_click",
     {
       title: "Click",
-      description: "Click an element in the session.",
-      inputSchema: { sessionId: SESSION, selector: SELECTOR },
+      description: "Click an element (by ref from browser_snapshot).",
+      inputSchema: { sessionId: SESSION, ref: REF, element: ELEMENT },
     },
-    ({ sessionId, selector }) =>
-      run(async () => {
-        await manager.get(sessionId).click(selector);
-        return `Clicked '${selector}' in session '${sessionId}'.`;
-      }),
+    async ({ sessionId, ref, element }) => {
+      await manager.get(sessionId).click({ ref, element });
+      return `Clicked ${element} in session '${sessionId}'.`;
+    },
   );
 
-  server.registerTool(
+  tool(
     "browser_type",
     {
       title: "Type",
-      description: "Fill an input with text in the session.",
-      inputSchema: { sessionId: SESSION, selector: SELECTOR, text: z.string() },
+      description: "Fill an input with text (by ref from browser_snapshot).",
+      inputSchema: { sessionId: SESSION, ref: REF, element: ELEMENT, text: z.string() },
     },
-    ({ sessionId, selector, text }) =>
-      run(async () => {
-        await manager.get(sessionId).type(selector, text);
-        return `Typed into '${selector}' in session '${sessionId}'.`;
-      }),
+    async ({ sessionId, ref, element, text }) => {
+      await manager.get(sessionId).type({ ref, element }, text);
+      return `Typed into ${element} in session '${sessionId}'.`;
+    },
   );
 
-  server.registerTool(
+  tool(
     "browser_hover",
     {
       title: "Hover",
-      description: "Hover over an element in the session.",
-      inputSchema: { sessionId: SESSION, selector: SELECTOR },
+      description: "Hover over an element (by ref from browser_snapshot).",
+      inputSchema: { sessionId: SESSION, ref: REF, element: ELEMENT },
     },
-    ({ sessionId, selector }) =>
-      run(async () => {
-        await manager.get(sessionId).hover(selector);
-        return `Hovered '${selector}' in session '${sessionId}'.`;
-      }),
+    async ({ sessionId, ref, element }) => {
+      await manager.get(sessionId).hover({ ref, element });
+      return `Hovered ${element} in session '${sessionId}'.`;
+    },
   );
 
-  server.registerTool(
+  tool(
     "browser_press_key",
     {
       title: "Press key",
       description: 'Press a keyboard key (e.g. "Enter", "ArrowDown").',
       inputSchema: { sessionId: SESSION, key: z.string() },
     },
-    ({ sessionId, key }) =>
-      run(async () => {
-        await manager.get(sessionId).pressKey(key);
-        return `Pressed '${key}' in session '${sessionId}'.`;
-      }),
+    async ({ sessionId, key }) => {
+      await manager.get(sessionId).pressKey(key);
+      return `Pressed '${key}' in session '${sessionId}'.`;
+    },
   );
 
-  server.registerTool(
+  tool(
     "browser_select_option",
     {
       title: "Select option",
-      description: "Select one or more options in a <select> element.",
-      inputSchema: { sessionId: SESSION, selector: SELECTOR, values: z.array(z.string()) },
+      description: "Select one or more options in a <select> (by ref from browser_snapshot).",
+      inputSchema: { sessionId: SESSION, ref: REF, element: ELEMENT, values: z.array(z.string()) },
     },
-    ({ sessionId, selector, values }) =>
-      run(async () => {
-        const selected = await manager.get(sessionId).selectOption(selector, values);
-        return `Selected ${JSON.stringify(selected)} in '${selector}'.`;
-      }),
+    async ({ sessionId, ref, element, values }) => {
+      const selected = await manager.get(sessionId).selectOption({ ref, element }, values);
+      return `Selected ${JSON.stringify(selected)} in ${element}.`;
+    },
   );
 
-  server.registerTool(
+  tool(
     "browser_fill_form",
     {
       title: "Fill form",
-      description: "Fill several fields in one call.",
+      description: "Fill several fields in one call (each by ref from browser_snapshot).",
       inputSchema: {
         sessionId: SESSION,
-        fields: z.array(z.object({ selector: z.string(), value: z.string() })),
+        fields: z.array(z.object({ ref: REF, element: ELEMENT, value: z.string() })),
       },
     },
-    ({ sessionId, fields }) =>
-      run(async () => {
-        await manager.get(sessionId).fillForm(fields);
-        return `Filled ${String(fields.length)} field(s) in session '${sessionId}'.`;
-      }),
+    async ({ sessionId, fields }) => {
+      await manager.get(sessionId).fillForm(fields);
+      return `Filled ${String(fields.length)} field(s) in session '${sessionId}'.`;
+    },
   );
 
-  server.registerTool(
+  tool(
     "browser_file_upload",
     {
       title: "Upload files",
-      description: "Set files on a file input.",
+      description: "Set files on a file input (by ref from browser_snapshot).",
       inputSchema: {
         sessionId: SESSION,
-        selector: SELECTOR,
+        ref: REF,
+        element: ELEMENT,
         paths: z
           .array(z.string())
           .describe("File paths (confined to the upload dir if configured)"),
       },
     },
-    ({ sessionId, selector, paths }) =>
-      run(async () => {
-        const uploadDir = security.uploadDir;
-        const resolved =
-          uploadDir === undefined ? paths : paths.map((p) => resolveWithinDir(uploadDir, p));
-        await manager.get(sessionId).fileUpload(selector, resolved);
-        return `Uploaded ${String(resolved.length)} file(s) to '${selector}'.`;
-      }),
+    async ({ sessionId, ref, element, paths }) => {
+      const uploadDir = security.uploadDir;
+      const resolved =
+        uploadDir === undefined ? paths : paths.map((p) => resolveWithinDir(uploadDir, p));
+      await manager.get(sessionId).fileUpload({ ref, element }, resolved);
+      return `Uploaded ${String(resolved.length)} file(s) to ${element}.`;
+    },
   );
 
-  server.registerTool(
+  tool(
     "browser_drag",
     {
       title: "Drag and drop",
-      description: "Drag one element onto another.",
+      description: "Drag one element onto another (both by ref from browser_snapshot).",
       inputSchema: {
         sessionId: SESSION,
-        sourceSelector: z.string(),
-        targetSelector: z.string(),
+        sourceRef: REF,
+        sourceElement: ELEMENT,
+        targetRef: REF,
+        targetElement: ELEMENT,
       },
     },
-    ({ sessionId, sourceSelector, targetSelector }) =>
-      run(async () => {
-        await manager.get(sessionId).drag(sourceSelector, targetSelector);
-        return `Dragged '${sourceSelector}' onto '${targetSelector}'.`;
-      }),
+    async ({ sessionId, sourceRef, sourceElement, targetRef, targetElement }) => {
+      await manager
+        .get(sessionId)
+        .drag(
+          { ref: sourceRef, element: sourceElement },
+          { ref: targetRef, element: targetElement },
+        );
+      return `Dragged ${sourceElement} onto ${targetElement}.`;
+    },
   );
 
-  server.registerTool(
+  tool(
     "browser_resize",
     {
       title: "Resize viewport",
@@ -312,127 +354,122 @@ export function createServer(
         height: z.number().int().positive(),
       },
     },
-    ({ sessionId, width, height }) =>
-      run(async () => {
-        await manager.get(sessionId).resize(width, height);
-        return `Resized session '${sessionId}' to ${String(width)}x${String(height)}.`;
-      }),
+    async ({ sessionId, width, height }) => {
+      await manager.get(sessionId).resize(width, height);
+      return `Resized session '${sessionId}' to ${String(width)}x${String(height)}.`;
+    },
   );
 
-  server.registerTool(
+  // --- Inspection ------------------------------------------------------------
+
+  tool(
     "browser_screenshot",
     {
       title: "Screenshot",
       description:
-        "Save a screenshot of the active page to a file within the configured output directory.",
+        "Capture a PNG of the active page and return it as an image. Optionally also save it to a file within the output dir.",
       inputSchema: {
         sessionId: SESSION,
-        path: z.string().describe("File path, relative to the configured output directory"),
-        fullPage: z.boolean().optional(),
+        fullPage: z.boolean().default(false),
+        path: z
+          .string()
+          .optional()
+          .describe("Optional file path within the output dir to also save to"),
       },
     },
-    ({ sessionId, path: requestedPath, fullPage }) =>
-      run(async () => {
-        const dest = resolveWithinDir(security.outputDir, requestedPath);
-        await manager.get(sessionId).screenshot(dest, fullPage ?? false);
-        return `Saved screenshot to ${dest}.`;
-      }),
+    async ({ sessionId, fullPage, path }): Promise<CallToolResult> => {
+      const png = await manager.get(sessionId).screenshot(fullPage);
+      const content: CallToolResult["content"] = [];
+      if (path !== undefined) {
+        const dest = resolveWithinDir(security.outputDir, path);
+        await mkdir(dirname(dest), { recursive: true });
+        await writeFile(dest, png);
+        content.push({ type: "text", text: `Saved screenshot to ${dest}.` });
+      }
+      content.push({ type: "image", data: png.toString("base64"), mimeType: "image/png" });
+      return { content };
+    },
   );
 
-  server.registerTool(
+  tool(
     "browser_snapshot",
     {
       title: "Accessibility snapshot",
-      description: "Get the ARIA accessibility snapshot (YAML) of the active page.",
+      description:
+        "Get the accessibility snapshot (YAML) of the active page, including element refs to target with other tools.",
       inputSchema: { sessionId: SESSION },
     },
-    ({ sessionId }) => run(() => manager.get(sessionId).snapshot()),
+    ({ sessionId }) => manager.get(sessionId).snapshot(),
   );
 
-  server.registerTool(
+  tool(
     "browser_evaluate",
     {
       title: "Evaluate JavaScript",
       description: "Run a JavaScript expression in the page and return the JSON-serialized result.",
       inputSchema: { sessionId: SESSION, script: z.string() },
     },
-    ({ sessionId, script }) =>
-      run(async () => {
-        const result = await manager.get(sessionId).evaluate(script);
-        // page.evaluate returns undefined for void scripts; JSON.stringify(undefined)
-        // is the JS value undefined, which would make an invalid content block.
-        return result === undefined ? "undefined" : JSON.stringify(result, null, 2);
-      }),
+    async ({ sessionId, script }) => {
+      const result = await manager.get(sessionId).evaluate(script);
+      // page.evaluate returns undefined for void scripts; JSON.stringify(undefined)
+      // is the JS value undefined, which would make an invalid content block.
+      return result === undefined ? "undefined" : JSON.stringify(result, null, 2);
+    },
   );
 
-  server.registerTool(
+  tool(
     "browser_wait_for",
     {
       title: "Wait for selector",
-      description: "Wait until a selector reaches a state.",
+      description: "Wait until a CSS selector reaches a state.",
       inputSchema: {
         sessionId: SESSION,
-        selector: SELECTOR,
-        state: z.enum(["attached", "detached", "visible", "hidden"]).optional(),
-        timeout: z
-          .number()
-          .int()
-          .positive()
-          .optional()
-          .describe("Timeout in milliseconds; defaults to 30000"),
+        selector: z.string().describe("CSS selector to wait for"),
+        state: z.enum(["attached", "detached", "visible", "hidden"]).default("visible"),
+        timeout: z.number().int().positive().default(30_000).describe("Timeout in milliseconds"),
       },
     },
-    ({ sessionId, selector, state, timeout }) =>
-      run(async () => {
-        const target: WaitForState = state ?? "visible";
-        await manager.get(sessionId).waitFor(selector, target, timeout ?? 30_000);
-        return `'${selector}' reached '${target}' in session '${sessionId}'.`;
-      }),
+    async ({ sessionId, selector, state, timeout }) => {
+      await manager.get(sessionId).waitFor(selector, state, timeout);
+      return `'${selector}' reached '${state}' in session '${sessionId}'.`;
+    },
   );
 
-  server.registerTool(
+  tool(
     "browser_console_messages",
     {
       title: "Console messages",
       description: "Return console messages captured in the session.",
-      inputSchema: { sessionId: SESSION, onlyErrors: z.boolean().optional() },
+      inputSchema: { sessionId: SESSION, onlyErrors: z.boolean().default(false) },
     },
     ({ sessionId, onlyErrors }) =>
-      run(() =>
-        JSON.stringify(manager.get(sessionId).consoleMessages(onlyErrors ?? false), null, 2),
-      ),
+      JSON.stringify(manager.get(sessionId).consoleMessages(onlyErrors), null, 2),
   );
 
-  server.registerTool(
+  tool(
     "browser_network_requests",
     {
       title: "Network requests",
       description: "Return network responses captured in the session.",
       inputSchema: { sessionId: SESSION },
     },
-    ({ sessionId }) =>
-      run(() => JSON.stringify(manager.get(sessionId).networkResponses(), null, 2)),
+    ({ sessionId }) => JSON.stringify(manager.get(sessionId).networkResponses(), null, 2),
   );
 
-  server.registerTool(
+  tool(
     "browser_handle_dialog",
     {
       title: "Handle dialog",
       description: "Decide the next dialog (alert/confirm/prompt) instead of auto-dismissing it.",
-      inputSchema: {
-        sessionId: SESSION,
-        accept: z.boolean(),
-        promptText: z.string().optional(),
-      },
+      inputSchema: { sessionId: SESSION, accept: z.boolean(), promptText: z.string().optional() },
     },
-    ({ sessionId, accept, promptText }) =>
-      run(async () => {
-        await manager.get(sessionId).handleDialog(accept, promptText);
-        return `Next dialog will be ${accept ? "accepted" : "dismissed"} in session '${sessionId}'.`;
-      }),
+    async ({ sessionId, accept, promptText }) => {
+      await manager.get(sessionId).handleDialog(accept, promptText);
+      return `Next dialog will be ${accept ? "accepted" : "dismissed"} in session '${sessionId}'.`;
+    },
   );
 
-  server.registerTool(
+  tool(
     "browser_tabs",
     {
       title: "Tabs",
@@ -443,28 +480,25 @@ export function createServer(
         index: z.number().int().nonnegative().optional().describe("Tab index for close/select"),
       },
     },
-    ({ sessionId, action, index }) =>
-      run(async () => {
-        const session = manager.get(sessionId);
-        switch (action) {
-          case "list":
-            return JSON.stringify(await session.listTabs(), null, 2);
-          case "new": {
-            const newIndex = await session.newTab();
-            return `Opened tab ${String(newIndex)} in session '${sessionId}'.`;
-          }
-          case "close": {
-            const target = requireIndex(index, action);
-            await session.closeTab(target);
-            return `Closed tab ${String(target)} in session '${sessionId}'.`;
-          }
-          case "select": {
-            const target = requireIndex(index, action);
-            await session.selectTab(target);
-            return `Selected tab ${String(target)} in session '${sessionId}'.`;
-          }
+    async ({ sessionId, action, index }) => {
+      const session = manager.get(sessionId);
+      switch (action) {
+        case "list":
+          return JSON.stringify(await session.listTabs(), null, 2);
+        case "new":
+          return `Opened tab ${String(await session.newTab())} in session '${sessionId}'.`;
+        case "close": {
+          const target = requireIndex(index, action);
+          await session.closeTab(target);
+          return `Closed tab ${String(target)} in session '${sessionId}'.`;
         }
-      }),
+        case "select": {
+          const target = requireIndex(index, action);
+          await session.selectTab(target);
+          return `Selected tab ${String(target)} in session '${sessionId}'.`;
+        }
+      }
+    },
   );
 
   return server;

@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import type { Browser, BrowserContext } from "playwright";
+import { BrowserProvider } from "../src/browser-provider";
 import {
   SessionManager,
   type SessionManagerOptions,
@@ -53,12 +54,14 @@ class FakeBrowser {
 function setup(options?: SessionManagerOptions): {
   manager: SessionManager;
   browser: FakeBrowser;
+  provider: BrowserProvider;
   launch: ReturnType<typeof vi.fn>;
 } {
   const browser = new FakeBrowser();
   const launch = vi.fn(async () => browser as unknown as Browser);
-  const manager = new SessionManager(launch, options);
-  return { manager, browser, launch };
+  const provider = new BrowserProvider(launch);
+  const manager = new SessionManager(provider, options);
+  return { manager, browser, provider, launch };
 }
 
 describe("SessionManager isolation", () => {
@@ -84,14 +87,14 @@ describe("SessionManager isolation", () => {
 });
 
 describe("SessionManager browser lifecycle", () => {
-  it("launches the browser lazily, only on first session", async () => {
+  it("acquires the browser lazily, only on first session", async () => {
     const { manager, launch } = setup();
     expect(launch).not.toHaveBeenCalled();
     await manager.createSession("a");
     expect(launch).toHaveBeenCalledTimes(1);
   });
 
-  it("launches exactly once for many concurrent sessions", async () => {
+  it("shares one browser across many concurrent sessions", async () => {
     const { manager, browser, launch } = setup();
     const ids = Array.from({ length: 12 }, (_, i) => `s${String(i)}`);
 
@@ -100,23 +103,6 @@ describe("SessionManager browser lifecycle", () => {
     expect(launch).toHaveBeenCalledTimes(1);
     expect(browser.contexts).toHaveLength(12);
     expect(manager.size).toBe(12);
-  });
-
-  it("relaunches the browser after closeAll", async () => {
-    const { manager, launch } = setup();
-    await manager.createSession("a");
-    await manager.closeAll();
-    await manager.createSession("b");
-    expect(launch).toHaveBeenCalledTimes(2);
-  });
-
-  it("relaunches when the existing browser is disconnected (crash recovery)", async () => {
-    const { manager, browser, launch } = setup();
-    await manager.createSession("a");
-    expect(launch).toHaveBeenCalledTimes(1);
-    browser.connected = false; // simulate a crash without going through closeAll
-    await manager.createSession("b");
-    expect(launch).toHaveBeenCalledTimes(2);
   });
 });
 
@@ -135,16 +121,19 @@ describe("SessionManager teardown", () => {
     expect(manager.size).toBe(1);
   });
 
-  it("closeAll closes every context and the browser", async () => {
-    const { manager, browser } = setup();
+  it("closeAll closes every context but leaves the shared browser to the provider", async () => {
+    const { manager, browser, provider } = setup();
     await manager.createSession("a");
     await manager.createSession("b");
 
     await manager.closeAll();
-
     expect(browser.contexts.every((c) => c.closed)).toBe(true);
-    expect(browser.closed).toBe(true);
     expect(manager.size).toBe(0);
+    // The browser belongs to the provider, not the manager.
+    expect(browser.closed).toBe(false);
+
+    await provider.close();
+    expect(browser.closed).toBe(true);
   });
 });
 

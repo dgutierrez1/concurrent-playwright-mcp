@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import type { BrowserContext } from "playwright";
 import { BrowserSession } from "../src/session";
-import { TabLimitError, TabOutOfRangeError } from "../src/errors";
+import { ElementRefError, TabLimitError, TabOutOfRangeError } from "../src/errors";
 
 /**
  * Minimal fakes for the slice of Playwright {@link BrowserContext}/Page that
@@ -13,6 +13,8 @@ type Handler = (arg: unknown) => void;
 class FakePage {
   closed = false;
   goBackResult: unknown = null;
+  /** How many elements an `aria-ref=` locator resolves to (0 = stale ref). */
+  locatorCount = 1;
   readonly #listeners = new Map<string, Handler[]>();
 
   on(event: string, handler: Handler): void {
@@ -44,6 +46,18 @@ class FakePage {
   }
   async bringToFront(): Promise<void> {
     /* no-op */
+  }
+  locator(): unknown {
+    const noop = (): Promise<void> => Promise.resolve();
+    return {
+      count: (): Promise<number> => Promise.resolve(this.locatorCount),
+      click: noop,
+      fill: noop,
+      hover: noop,
+      selectOption: (): Promise<string[]> => Promise.resolve([]),
+      setInputFiles: noop,
+      dragTo: noop,
+    };
   }
 }
 
@@ -116,7 +130,7 @@ describe("BrowserSession capture", () => {
     page?.emit("console", consoleMsg("log", "hello"));
     page?.emit("console", consoleMsg("error", "boom"));
 
-    expect(session.consoleMessages()).toHaveLength(2);
+    expect(session.consoleMessages(false)).toHaveLength(2);
     const errorsOnly = session.consoleMessages(true);
     expect(errorsOnly).toHaveLength(1);
     expect(errorsOnly[0]?.text).toBe("boom");
@@ -129,7 +143,7 @@ describe("BrowserSession capture", () => {
     for (let i = 0; i < 5; i++) {
       page?.emit("console", consoleMsg("log", `m${String(i)}`));
     }
-    const texts = session.consoleMessages().map((m) => m.text);
+    const texts = session.consoleMessages(false).map((m) => m.text);
     expect(texts).toEqual(["m2", "m3", "m4"]);
   });
 
@@ -190,5 +204,41 @@ describe("BrowserSession navigation", () => {
       page.goBackResult = { ok: true };
     }
     expect(await session.navigateBack()).toBe(true);
+  });
+});
+
+describe("BrowserSession ref targeting", () => {
+  it("acts on a ref that resolves", async () => {
+    const { session, context } = makeSession();
+    await session.page();
+    const page = context.pagesList[0];
+    if (page) {
+      page.locatorCount = 1;
+    }
+    await expect(session.click({ ref: "e1", element: "OK" })).resolves.toBeUndefined();
+  });
+
+  it("throws ElementRefError (fast) when a ref resolves to nothing", async () => {
+    const { session, context } = makeSession();
+    await session.page();
+    const page = context.pagesList[0];
+    if (page) {
+      page.locatorCount = 0;
+    }
+    await expect(session.click({ ref: "e404", element: "ghost" })).rejects.toBeInstanceOf(
+      ElementRefError,
+    );
+  });
+
+  it("drag blames the stale ref", async () => {
+    const { session, context } = makeSession();
+    await session.page();
+    const page = context.pagesList[0];
+    if (page) {
+      page.locatorCount = 0;
+    }
+    await expect(
+      session.drag({ ref: "eSrc", element: "source" }, { ref: "eDst", element: "dest" }),
+    ).rejects.toBeInstanceOf(ElementRefError);
   });
 });

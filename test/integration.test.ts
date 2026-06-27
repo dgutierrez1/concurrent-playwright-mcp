@@ -1,25 +1,31 @@
 import { createServer, type Server } from "node:http";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
-import { chromiumLauncher } from "../src/playwright-launcher.js";
-import { SessionManager } from "../src/session-manager.js";
+import { BrowserProvider } from "../src/browser-provider";
+import { chromiumLauncher } from "../src/playwright-launcher";
+import { SessionManager } from "../src/session-manager";
 
 /**
  * Real-browser tests. Skipped unless RUN_INTEGRATION=1 and Chromium is
  * installed (`npm run setup:browser`). They prove the headline guarantee with
  * an actual browser: two sessions on the *same origin* still have fully
- * isolated storage.
+ * isolated storage — plus the ref-targeting and image-screenshot paths.
  */
 const enabled = process.env.RUN_INTEGRATION === "1";
+
+const PAGE = `<!doctype html><html><head><title>iso</title></head><body>
+<button id="go" onclick="window.__clicked = true">Go</button>
+ok</body></html>`;
 
 describe.skipIf(!enabled)("real-browser session isolation", () => {
   let httpServer: Server;
   let baseUrl: string;
+  let provider: BrowserProvider;
   let manager: SessionManager;
 
   beforeAll(async () => {
     httpServer = createServer((_req, res) => {
       res.writeHead(200, { "content-type": "text/html" });
-      res.end("<!doctype html><html><head><title>iso</title></head><body>ok</body></html>");
+      res.end(PAGE);
     });
     await new Promise<void>((resolve) => {
       httpServer.listen(0, "127.0.0.1", resolve);
@@ -39,10 +45,17 @@ describe.skipIf(!enabled)("real-browser session isolation", () => {
 
   afterEach(async () => {
     await manager.closeAll();
+    await provider.close();
   });
 
+  function newManager(options?: { maxSessions?: number }): SessionManager {
+    provider = new BrowserProvider(chromiumLauncher({ headless: true }));
+    manager = new SessionManager(provider, options);
+    return manager;
+  }
+
   it("keeps localStorage isolated between concurrent same-origin sessions", async () => {
-    manager = new SessionManager(chromiumLauncher({ headless: true }));
+    newManager();
     await Promise.all([manager.createSession("a"), manager.createSession("b")]);
 
     const a = manager.get("a");
@@ -61,9 +74,7 @@ describe.skipIf(!enabled)("real-browser session isolation", () => {
 
   it("keeps storage isolated across N concurrent sessions with zero collisions", async () => {
     const sessionCount = 10;
-    manager = new SessionManager(chromiumLauncher({ headless: true }), {
-      maxSessions: sessionCount + 1,
-    });
+    newManager({ maxSessions: sessionCount + 1 });
     const ids = Array.from({ length: sessionCount }, (_, i) => `session-${String(i)}`);
 
     await Promise.all(
@@ -85,15 +96,38 @@ describe.skipIf(!enabled)("real-browser session isolation", () => {
     expect(collisions).toBe(0);
   });
 
+  it("targets an element by ref from a snapshot and clicks it", async () => {
+    newManager();
+    const session = await manager.createSession("ref");
+    await session.navigate(baseUrl);
+
+    const snapshot = await session.snapshot();
+    const ref = /button[^\n]*\[ref=(e\d+)\]/.exec(snapshot)?.[1];
+    expect(ref, `no button ref in snapshot:\n${snapshot}`).toBeDefined();
+
+    await session.click({ ref: ref ?? "", element: "Go button" });
+    expect(await session.evaluate("window.__clicked === true")).toBe(true);
+  });
+
+  it("returns screenshot bytes as a PNG", async () => {
+    newManager();
+    const session = await manager.createSession("shot");
+    await session.navigate(baseUrl);
+
+    const png = await session.screenshot(false);
+    const pngSignature = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+    expect(png.subarray(0, 8)).toEqual(pngSignature);
+  });
+
   it("captures console output per session", async () => {
-    manager = new SessionManager(chromiumLauncher({ headless: true }));
+    newManager();
     const session = await manager.createSession("c");
     await session.navigate(baseUrl);
     await session.evaluate("console.log('hello from page')");
 
     // Poll instead of a fixed sleep: the console event arrives asynchronously.
     await expect
-      .poll(() => session.consoleMessages().some((m) => m.text.includes("hello from page")), {
+      .poll(() => session.consoleMessages(false).some((m) => m.text.includes("hello from page")), {
         timeout: 5_000,
       })
       .toBe(true);

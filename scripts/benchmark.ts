@@ -1,7 +1,8 @@
 import { createServer } from "node:http";
 import { performance } from "node:perf_hooks";
-import { chromiumLauncher } from "../src/playwright-launcher.js";
-import { SessionManager } from "../src/session-manager.js";
+import { BrowserProvider } from "../src/browser-provider";
+import { chromiumLauncher } from "../src/playwright-launcher";
+import { SessionManager } from "../src/session-manager";
 
 /**
  * Benchmark: spin up N isolated sessions concurrently, have each write a unique
@@ -26,9 +27,8 @@ async function main(): Promise<void> {
   const port = typeof address === "object" && address !== null ? address.port : 0;
   const baseUrl = `http://127.0.0.1:${String(port)}/`;
 
-  const manager = new SessionManager(chromiumLauncher({ headless: true }), {
-    maxSessions: sessionCount + 1,
-  });
+  const provider = new BrowserProvider(chromiumLauncher({ headless: true }));
+  const manager = new SessionManager(provider, { maxSessions: sessionCount + 1 });
   const ids = Array.from({ length: sessionCount }, (_, i) => `session-${String(i)}`);
 
   const start = performance.now();
@@ -50,6 +50,7 @@ async function main(): Promise<void> {
   }
 
   await manager.closeAll();
+  await provider.close();
   await new Promise<void>((resolve) => {
     httpServer.close(() => {
       resolve();

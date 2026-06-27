@@ -1,6 +1,6 @@
 import { chromium } from "playwright";
 import type { LaunchOptions as PlaywrightLaunchOptions } from "playwright";
-import type { BrowserLauncher } from "./session-manager.js";
+import type { BrowserLauncher } from "./browser-provider";
 
 export interface LaunchOptions {
   /** Run without a visible window. Defaults to true (right for servers/CI). */

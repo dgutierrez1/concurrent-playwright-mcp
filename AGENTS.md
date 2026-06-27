@@ -2,11 +2,15 @@
 
 Conventions for humans and AI agents working in this repo. Keep changes consistent with this file.
 
-## Cross-cutting principles (shared across all portfolio repos)
+## Cross-cutting principles
 
 - **Clean architecture, one direction.** Domain logic does not depend on transport. Here:
   `SessionManager`/`BrowserSession` (domain) know nothing about MCP; `server.ts` (transport) is a
   thin delegate. Never leak transport shapes (MCP `content`) into the domain.
+- **Parse, don't validate.** Untrusted input is validated and shaped at the edge (`server.ts` via
+  Zod, with `.default()` for defaults); inner layers receive complete, typed values and keep only
+  genuine domain-state checks (a session/tab lookup miss). Use `as` only to bridge external
+  (Playwright) types, never to skip a real check.
 - **Dependency inversion at the seams that need testing.** The browser is injected as a
   `BrowserLauncher` so the isolation logic is unit-testable with fakes. Inject only where it buys
   testability or swappability; do not add abstraction layers a small tool does not need.
@@ -23,11 +27,12 @@ Conventions for humans and AI agents working in this repo. Keep changes consiste
 ## Stack and tooling
 
 - **Language/runtime:** TypeScript (strict) on Node 20+, **ESM only** (`"type": "module"`).
-- **Imports:** relative imports carry the `.js` extension (NodeNext resolution).
+- **Imports:** extensionless relative imports (`moduleResolution: bundler`; the output is bundled by
+  tsup). SDK subpath imports keep their published `.js` (`.../server/mcp.js`).
 - **MCP:** `@modelcontextprotocol/sdk` v1.x with the high-level `McpServer` + `registerTool`.
-  `inputSchema` is a **raw Zod shape** (`{ a: z.string() }`), not `z.object({...})`. Subpath imports
-  use `.js` (`.../server/mcp.js`). A stdio server **must not write to stdout** (it is the JSON-RPC
-  channel) — log to stderr.
+  `inputSchema` is a **raw Zod shape** (`{ a: z.string() }`), not `z.object({...})`. Transports:
+  stdio (default) and Streamable HTTP. A stdio server **must not write to stdout** (it is the
+  JSON-RPC channel) — log to stderr.
 - **Browser:** Playwright. One shared `Browser`, one isolated `BrowserContext` per session. Always
   `await` closes; clean up on `SIGINT`/`SIGTERM`. Bound resources (session cap + idle eviction).
 - **Build:** tsup (ESM, `dts`, sourcemaps). **Types:** `tsc --noEmit`. **Lint:** ESLint flat config
@@ -47,15 +52,27 @@ Conventions for humans and AI agents working in this repo. Keep changes consiste
 
 ```
 src/
-  cli.ts                 entrypoint (shebang); env config + stdio + signal handling
-  server.ts              MCP tool registration (transport edge)
-  session-manager.ts     shared browser + isolated sessions (domain core)
-  session.ts             one isolated context: page lifecycle, ops, capture
+  cli.ts                 entrypoint (shebang); load config → pick transport
+  config.ts              env parsing/validation into a typed AppConfig
+  transport/stdio.ts     run over stdio
+  transport/http.ts      run Streamable HTTP (manager per client, shared browser)
+  server.ts              MCP edge: Zod validation + defaults, ref targeting, error map
+  policy/url-policy.ts   pure URL policy (allowlist, file:/data: blocking)
+  policy/path-policy.ts  pure filesystem path confinement
+  errors.ts              error taxonomy: SessionError base + codes
+  browser-provider.ts    shared lazy/memoized Browser (a port)
+  session-manager.ts     isolated sessions over a BrowserProvider (domain core)
+  session.ts             one isolated context: ref actions, capture, storage state
   playwright-launcher.ts production BrowserLauncher
   index.ts               public library barrel
 test/
-  session-manager.test.ts  unit tests (fake browser) — the isolation guarantee
-  integration.test.ts      real-Chromium, gated by RUN_INTEGRATION=1
+  session-manager.test.ts  unit (fake browser) — lifecycle/eviction/bounds
+  browser-provider.test.ts unit (fake browser) — lazy/memoize/relaunch
+  session.test.ts          unit (fake context/page) — capture, tabs, dialogs
+  server.test.ts           in-memory MCP round-trip — wiring + error mapping + policy
+  transport-http.test.ts   HTTP round-trip + per-client isolation (no Chromium)
+  policy/*.test.ts errors.test.ts config.test.ts  pure-unit coverage
+  integration.test.ts      real-Chromium, gated by RUN_INTEGRATION=1 (incl. ref + image)
 scripts/
   benchmark.ts  demo.ts
 ```

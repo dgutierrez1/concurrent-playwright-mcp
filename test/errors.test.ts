@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   DuplicateSessionError,
+  ElementRefError,
   InvalidArgumentError,
   NavigationBlockedError,
   PathNotAllowedError,
@@ -9,7 +10,7 @@ import {
   SessionNotFoundError,
   TabLimitError,
   TabOutOfRangeError,
-} from "../src/errors.js";
+} from "../src/errors";
 
 describe("error taxonomy", () => {
   it("every deliberate error is a SessionError with a code and its class name", () => {
@@ -20,6 +21,7 @@ describe("error taxonomy", () => {
       [new TabLimitError(5), "TAB_LIMIT", "TabLimitError"],
       [new TabOutOfRangeError(3, 1), "TAB_OUT_OF_RANGE", "TabOutOfRangeError"],
       [new InvalidArgumentError("x"), "INVALID_ARGUMENT", "InvalidArgumentError"],
+      [new ElementRefError("e9", "Submit"), "ELEMENT_REF_INVALID", "ElementRefError"],
       [new NavigationBlockedError("u", "why"), "NAVIGATION_BLOCKED", "NavigationBlockedError"],
       [new PathNotAllowedError("p", "/base"), "PATH_NOT_ALLOWED", "PathNotAllowedError"],
     ] as const;

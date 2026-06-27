@@ -38,7 +38,9 @@
     "benchmark": "tsx scripts/benchmark.ts",
     "demo": "tsx scripts/demo.ts",
     "setup:browser": "playwright install chromium",
-    "check": "npm run typecheck && npm run lint && npm run test"
+    "check": "npm run typecheck && npm run lint && npm run format:check && npm run test",
+    "prepack": "npm run build",
+    "prepublishOnly": "npm run check"
   },
   "keywords": [
     "mcp",
@@ -51,6 +53,17 @@
   ],
   "author": "Daniel Gutiérrez",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/dgutierrez1/concurrent-playwright-mcp.git"
+  },
+  "homepage": "https://github.com/dgutierrez1/concurrent-playwright-mcp#readme",
+  "bugs": {
+    "url": "https://github.com/dgutierrez1/concurrent-playwright-mcp/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",
     "playwright": "^1.61.1",
@@ -58,7 +71,7 @@
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
-    "@types/node": "^26.0.1",
+    "@types/node": "^20.0.0",
     "@vitest/coverage-v8": "^4.1.9",
     "eslint": "^10.5.0",
     "eslint-config-prettier": "^10.1.5",

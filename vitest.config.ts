@@ -8,9 +8,14 @@ export default defineConfig({
       provider: "v8",
       reporter: ["text", "html", "lcov"],
       include: ["src/**/*.ts"],
-      // The CLI entry and the Playwright adapter are exercised by the gated
-      // integration test, not unit tests; the logic lives in the manager/session.
-      exclude: ["src/index.ts", "src/cli.ts", "src/playwright-launcher.ts"],
+      // Entry/wiring adapters are exercised by the gated integration path, not
+      // unit tests; the logic lives in the manager/session/policy/config modules.
+      exclude: [
+        "src/index.ts",
+        "src/cli.ts",
+        "src/playwright-launcher.ts",
+        "src/transport/stdio.ts",
+      ],
     },
   },
 });

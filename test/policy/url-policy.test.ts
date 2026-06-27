@@ -1,7 +1,6 @@
-import path from "node:path";
 import { describe, expect, it } from "vitest";
-import { NavigationBlockedError, PathNotAllowedError } from "../src/errors.js";
-import { assertUrlAllowed, resolveWithinDir } from "../src/security.js";
+import { NavigationBlockedError } from "../../src/errors";
+import { assertUrlAllowed } from "../../src/policy/url-policy";
 
 describe("assertUrlAllowed", () => {
   it("allows http(s) by default", () => {
@@ -51,21 +50,5 @@ describe("assertUrlAllowed", () => {
     expect(() => {
       assertUrlAllowed("https://anywhere.com", { allowFileUrls: false, allowedOrigins: [] });
     }).not.toThrow();
-  });
-});
-
-describe("resolveWithinDir", () => {
-  const base = path.resolve("output");
-
-  it("resolves a relative path within the directory", () => {
-    expect(resolveWithinDir(base, "shot.png")).toBe(path.join(base, "shot.png"));
-    expect(resolveWithinDir(base, "sub/shot.png")).toBe(path.join(base, "sub", "shot.png"));
-  });
-
-  it("rejects traversal, absolute escapes, and the dir itself", () => {
-    expect(() => resolveWithinDir(base, "../escape.png")).toThrow(PathNotAllowedError);
-    expect(() => resolveWithinDir(base, "/etc/passwd")).toThrow(PathNotAllowedError);
-    expect(() => resolveWithinDir(base, "")).toThrow(PathNotAllowedError);
-    expect(() => resolveWithinDir(base, "sub/../../escape.png")).toThrow(PathNotAllowedError);
   });
 });

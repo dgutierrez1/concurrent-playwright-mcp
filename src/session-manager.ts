@@ -1,6 +1,12 @@
-import type { Browser } from "playwright";
-import { BrowserSession } from "./session.js";
-import { DuplicateSessionError, SessionLimitError, SessionNotFoundError } from "./errors.js";
+import type { BrowserContextOptions } from "playwright";
+import type { BrowserProvider } from "./browser-provider";
+import {
+  BrowserSession,
+  DEFAULT_ACTION_TIMEOUT_MS,
+  DEFAULT_MAX_CAPTURE_ENTRIES,
+  DEFAULT_MAX_TABS,
+} from "./session";
+import { DuplicateSessionError, SessionLimitError, SessionNotFoundError } from "./errors";
 
 export interface Viewport {
   width: number;
@@ -9,6 +15,8 @@ export interface Viewport {
 
 export interface CreateSessionOptions {
   viewport?: Viewport;
+  /** Path to a Playwright storageState JSON to seed cookies/localStorage from. */
+  storageStatePath?: string;
 }
 
 export interface SessionManagerOptions {
@@ -24,21 +32,16 @@ export interface SessionManagerOptions {
   maxTabs?: number;
   /** Max console/network entries retained per session (ring buffer). Default 1000. */
   maxCaptureEntries?: number;
+  /** Per-action timeout (ms) for element interactions. Default 15000. */
+  actionTimeoutMs?: number;
   /** Clock, injectable for deterministic tests. Defaults to Date.now. */
   now?: () => number;
 }
 
-/**
- * Launches and returns a browser. Injected into {@link SessionManager} so the
- * lifecycle/isolation logic can be exercised with a fake browser in unit tests,
- * while production wires in a real Playwright launcher.
- */
-export type BrowserLauncher = () => Promise<Browser>;
-
 export const DEFAULT_VIEWPORT: Viewport = { width: 1440, height: 900 };
 export const DEFAULT_MAX_SESSIONS = 50;
-export const DEFAULT_MAX_TABS = 20;
-export const DEFAULT_MAX_CAPTURE_ENTRIES = 1000;
+// Re-exported from session.ts (the single source of truth) for config/back-compat.
+export { DEFAULT_MAX_TABS, DEFAULT_MAX_CAPTURE_ENTRIES, DEFAULT_ACTION_TIMEOUT_MS };
 
 interface SessionRecord {
   session: BrowserSession;
@@ -46,35 +49,34 @@ interface SessionRecord {
 }
 
 /**
- * Owns one shared browser process and a set of isolated {@link BrowserSession}s
- * keyed by id. Each session gets its own {@link import("playwright").BrowserContext},
- * so cookies, storage, and capture buffers never cross between sessions. This is
- * the difference from the stock Playwright MCP server, which multiplexes
- * everything through a single shared context.
+ * Owns a set of isolated {@link BrowserSession}s keyed by id, over a shared
+ * {@link BrowserProvider}. Each session gets its own
+ * {@link import("playwright").BrowserContext}, so cookies, storage, and capture
+ * buffers never cross between sessions — the difference from the stock Playwright
+ * MCP server, which multiplexes everything through a single shared context.
  *
- * The browser is launched lazily on first use and the launch is memoized, so
- * many sessions created concurrently share one browser without racing into
- * multiple launches. A session cap and optional idle eviction keep a
- * long-running server from leaking contexts.
+ * A session cap and optional idle eviction keep a long-running server from
+ * leaking contexts. The browser itself is owned by the provider, so one provider
+ * can back many managers (e.g. one per HTTP client) sharing a single Chromium.
  */
 export class SessionManager {
-  readonly #launch: BrowserLauncher;
+  readonly #provider: BrowserProvider;
   readonly #sessions = new Map<string, SessionRecord>();
   readonly #maxSessions: number;
   readonly #idleTimeoutMs: number;
   readonly #maxTabs: number;
   readonly #maxCaptureEntries: number;
+  readonly #actionTimeoutMs: number;
   readonly #now: () => number;
-  #browser: Browser | null = null;
-  #launchInFlight: Promise<Browser> | null = null;
   #sweepTimer: ReturnType<typeof setInterval> | null = null;
 
-  constructor(launch: BrowserLauncher, options: SessionManagerOptions = {}) {
-    this.#launch = launch;
+  constructor(provider: BrowserProvider, options: SessionManagerOptions = {}) {
+    this.#provider = provider;
     this.#maxSessions = options.maxSessions ?? DEFAULT_MAX_SESSIONS;
     this.#idleTimeoutMs = options.idleTimeoutMs ?? 0;
     this.#maxTabs = options.maxTabs ?? DEFAULT_MAX_TABS;
     this.#maxCaptureEntries = options.maxCaptureEntries ?? DEFAULT_MAX_CAPTURE_ENTRIES;
+    this.#actionTimeoutMs = options.actionTimeoutMs ?? DEFAULT_ACTION_TIMEOUT_MS;
     this.#now = options.now ?? Date.now;
   }
 
@@ -92,23 +94,6 @@ export class SessionManager {
     return [...this.#sessions.keys()];
   }
 
-  async #browserInstance(): Promise<Browser> {
-    if (this.#browser !== null && this.#browser.isConnected()) {
-      return this.#browser;
-    }
-    // Memoize an in-flight launch so concurrent callers share one browser.
-    if (this.#launchInFlight === null) {
-      this.#launchInFlight = this.#launch();
-      try {
-        this.#browser = await this.#launchInFlight;
-      } finally {
-        this.#launchInFlight = null;
-      }
-      return this.#browser;
-    }
-    return this.#launchInFlight;
-  }
-
   /**
    * Create a new isolated session. Throws {@link DuplicateSessionError} if the
    * id is in use, or {@link SessionLimitError} if the cap is reached.
@@ -123,13 +108,18 @@ export class SessionManager {
     if (this.#sessions.size >= this.#maxSessions) {
       throw new SessionLimitError(this.#maxSessions);
     }
-    const browser = await this.#browserInstance();
-    const context = await browser.newContext({
+    const browser = await this.#provider.acquire();
+    const contextOptions: BrowserContextOptions = {
       viewport: options.viewport ?? DEFAULT_VIEWPORT,
-    });
+    };
+    if (options.storageStatePath !== undefined) {
+      contextOptions.storageState = options.storageStatePath;
+    }
+    const context = await browser.newContext(contextOptions);
     const session = new BrowserSession(context, {
       maxTabs: this.#maxTabs,
       maxCaptureEntries: this.#maxCaptureEntries,
+      actionTimeoutMs: this.#actionTimeoutMs,
     });
     this.#sessions.set(sessionId, { session, lastUsed: this.#now() });
     return session;
@@ -194,16 +184,15 @@ export class SessionManager {
     }
   }
 
-  /** Close every session and the shared browser. Safe to call more than once. */
+  /**
+   * Close every session this manager owns. Does not close the shared browser —
+   * that belongs to the {@link BrowserProvider}, which may back other managers.
+   * Safe to call more than once.
+   */
   async closeAll(): Promise<void> {
     this.stopIdleSweeper();
     const records = [...this.#sessions.values()];
     this.#sessions.clear();
     await Promise.all(records.map((record) => record.session.close()));
-    if (this.#browser !== null) {
-      const browser = this.#browser;
-      this.#browser = null;
-      await browser.close();
-    }
   }
 }

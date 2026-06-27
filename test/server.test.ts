@@ -3,9 +3,9 @@ import { describe, expect, it } from "vitest";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
-import { SessionNotFoundError } from "../src/errors.js";
-import { createServer, type SecurityConfig } from "../src/server.js";
-import type { SessionManager } from "../src/session-manager.js";
+import { SessionNotFoundError } from "../src/errors";
+import { createServer, type SecurityConfig } from "../src/server";
+import type { SessionManager } from "../src/session-manager";
 
 /** A no-Playwright stand-in for the session layer — server tests exercise wiring, not the browser. */
 class FakeSession {
@@ -14,6 +14,9 @@ class FakeSession {
   }
   async evaluate(): Promise<unknown> {
     return undefined;
+  }
+  async screenshot(): Promise<Buffer> {
+    return Buffer.from("png");
   }
 }
 
@@ -71,7 +74,7 @@ describe("createServer wiring", () => {
   it("registers all browser tools", async () => {
     const { client } = await connect();
     const { tools } = await client.listTools();
-    expect(tools).toHaveLength(22);
+    expect(tools).toHaveLength(23);
     const names = tools.map((t) => t.name);
     expect(names).toContain("browser_create_session");
     expect(names).toContain("browser_tabs");
@@ -96,6 +99,17 @@ describe("createServer wiring", () => {
     expect(result.isError).toBeFalsy();
     expect(firstText(result)).toBe("undefined");
   });
+
+  it("returns a screenshot as an image content block", async () => {
+    const { client } = await connect();
+    await callTool(client, "browser_create_session", { sessionId: "a" });
+    const result = await callTool(client, "browser_screenshot", { sessionId: "a" });
+    expect(result.isError).toBeFalsy();
+    const image = result.content.find((c) => c.type === "image");
+    expect(image).toBeDefined();
+    expect(image?.type === "image" ? image.mimeType : "").toBe("image/png");
+    expect(image?.type === "image" ? image.data.length : 0).toBeGreaterThan(0);
+  });
 });
 
 describe("createServer error mapping (in-band, never thrown)", () => {
@@ -115,6 +129,32 @@ describe("createServer error mapping (in-band, never thrown)", () => {
     const result = await callTool(client, "browser_tabs", { sessionId: "a", action: "close" });
     expect(result.isError).toBe(true);
     expect(firstText(result)).toContain("INVALID_ARGUMENT");
+  });
+
+  it("turns a missing-Chromium error into an actionable install hint", async () => {
+    const throwingManager = {
+      ids: () => ["a"],
+      get: () => ({
+        navigate: () => {
+          throw new Error(
+            "browserType.launch: Executable doesn't exist at /ms-playwright/chromium/chrome\n" +
+              "╔════╗\n║ Looks like Playwright was just installed... ║\n╚════╝",
+          );
+        },
+      }),
+    };
+    const server = createServer(throwingManager as unknown as SessionManager, DEFAULT_SECURITY);
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    const client = new Client({ name: "test-client", version: "0.0.0" });
+    await Promise.all([client.connect(clientTransport), server.connect(serverTransport)]);
+
+    const result = (await client.callTool({
+      name: "browser_navigate",
+      arguments: { sessionId: "a", url: "https://example.com" },
+    })) as CallToolResult;
+    expect(result.isError).toBe(true);
+    expect(firstText(result)).toContain("npx playwright install chromium");
+    await client.close();
   });
 });
 
@@ -151,6 +191,16 @@ describe("createServer security enforcement", () => {
     const result = await callTool(client, "browser_screenshot", {
       sessionId: "a",
       path: "../escape.png",
+    });
+    expect(result.isError).toBe(true);
+    expect(firstText(result)).toContain("PATH_NOT_ALLOWED");
+  });
+
+  it("confines a create-session storageStatePath to the output directory", async () => {
+    const { client } = await connect();
+    const result = await callTool(client, "browser_create_session", {
+      sessionId: "a",
+      storageStatePath: "../../secrets.json",
     });
     expect(result.isError).toBe(true);
     expect(firstText(result)).toContain("PATH_NOT_ALLOWED");
