@@ -1,0 +1,28 @@
+name: Release
+
+# Publish to npm when a v* tag is pushed. Requires an NPM_TOKEN repo secret
+# (Settings → Secrets and variables → Actions). Publishes with provenance.
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+  id-token: write # required for npm provenance
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20.9.0"
+          registry-url: "https://registry.npmjs.org"
+          cache: npm
+      - run: npm ci
+      # prepublishOnly runs `npm run check`; prepack runs the build.
+      - run: npm publish --provenance --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

@@ -1,0 +1,72 @@
+{
+  "name": "concurrent-playwright-mcp",
+  "version": "0.1.0",
+  "description": "An MCP server that runs concurrent, session-isolated Playwright browser contexts, so many agents can each drive their own browser without colliding.",
+  "type": "module",
+  "engines": {
+    "node": ">=20.9.0"
+  },
+  "bin": {
+    "concurrent-playwright-mcp": "./dist/cli.js"
+  },
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist"
+  ],
+  "sideEffects": false,
+  "scripts": {
+    "build": "tsup",
+    "dev": "tsup --watch",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint .",
+    "lint:fix": "eslint . --fix",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage",
+    "test:integration": "RUN_INTEGRATION=1 vitest run test/integration.test.ts",
+    "benchmark": "tsx scripts/benchmark.ts",
+    "demo": "tsx scripts/demo.ts",
+    "setup:browser": "playwright install chromium",
+    "check": "npm run typecheck && npm run lint && npm run test"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "playwright",
+    "browser-automation",
+    "agents",
+    "concurrency",
+    "browser-context"
+  ],
+  "author": "Daniel Gutiérrez",
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "playwright": "^1.61.1",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@types/node": "^26.0.1",
+    "@vitest/coverage-v8": "^4.1.9",
+    "eslint": "^10.5.0",
+    "eslint-config-prettier": "^10.1.5",
+    "prettier": "^3.8.4",
+    "tsup": "^8.5.1",
+    "tsx": "^4.20.6",
+    "typescript": "^6.0.3",
+    "typescript-eslint": "^8.62.0",
+    "vitest": "^4.1.9"
+  }
+}

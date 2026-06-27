@@ -1,0 +1,29 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+
+# Test / coverage
+coverage/
+
+# Secrets and local env
+.env
+.env.*
+
+# Logs and OS cruft
+*.log
+.DS_Store
+
+# Screenshot output (default PW_OUTPUT_DIR)
+output/
+
+# Editor
+.vscode/
+.idea/
+
+# Playwright artifacts
+test-results/
+playwright-report/
+*.png
+!docs/**/*.png
