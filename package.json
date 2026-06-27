@@ -4,7 +4,7 @@
   "description": "An MCP server that runs concurrent, session-isolated Playwright browser contexts, so many agents can each drive their own browser without colliding.",
   "type": "module",
   "engines": {
-    "node": ">=20.9.0"
+    "node": ">=20.19.0"
   },
   "bin": {
     "concurrent-playwright-mcp": "./dist/cli.js"
