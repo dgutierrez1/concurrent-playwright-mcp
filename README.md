@@ -261,16 +261,9 @@ Errors are reported in-band (`isError`) with a stable `code` prefix (e.g. `NAVIG
 
 ## Demo and benchmark
 
-`agent-demo` is the quickest way to see the point: four "agents" drive the MCP server at the same
-time, each in its own isolated session, against a local app — their steps interleave in the terminal
-and a final check confirms no session saw another's state.
-
 ```bash
-npm run agent-demo   # four agents in parallel, each its own isolated session + an isolation check
-                     #   PW_HEADLESS=false to watch four browsers at once
-                     #   DEMO_STEP_MS=500 to slow each step down (good for recording)
-npm run demo         # two isolated sessions (desktop + mobile) drive a site in parallel
-npm run benchmark    # N parallel sessions, reports throughput + asserts 0 collisions
+npm run demo        # two isolated sessions (desktop + mobile) drive a site in parallel
+npm run benchmark   # N parallel sessions, reports throughput + asserts 0 collisions
 npm run benchmark 25
 ```
 
