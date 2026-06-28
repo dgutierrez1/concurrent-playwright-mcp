@@ -1,6 +1,6 @@
 {
   "name": "concurrent-playwright-mcp",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "An MCP server that runs concurrent, session-isolated Playwright browser contexts, so many agents can each drive their own browser without colliding.",
   "type": "module",
   "engines": {
