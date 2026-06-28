@@ -21,7 +21,7 @@ This server fixes that. Every session gets its **own** `BrowserContext` (an inco
 
 ### Why not `@playwright/mcp --isolated`?
 
-The official server can isolate too — its `--isolated` flag gives each *connection* its own context. The difference is the model:
+The official server can isolate too — its `--isolated` flag gives each _connection_ its own context. The difference is the model:
 
 - **Addressable sessions.** Here isolation is keyed by a `sessionId` you choose and pass to every call, so a single client can open and drive **many** isolated sessions and route each call deliberately. With `--isolated`, a "session" is just the transport connection — you can't address N parallel contexts from one client.
 - **Persistable, not ephemeral.** `--isolated` discards all state when the browser closes. Here you can `browser_save_storage_state` and restore it (`storageStatePath` on create) to resume an authenticated profile across sessions. (An upstream request for named/persistent sessions was closed as out of scope.)
