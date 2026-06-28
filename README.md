@@ -2,6 +2,12 @@
 
 An [MCP](https://modelcontextprotocol.io) server that runs **concurrent, session-isolated Playwright browser contexts**, so many agents can each drive their own browser at the same time without colliding.
 
+<p align="center">
+  <img src="https://raw.githubusercontent.com/dgutierrez1/concurrent-playwright-mcp/main/docs/demo.gif" alt="Multiple agents each driving their own isolated browser session in parallel" width="900">
+</p>
+
+<p align="center"><em>Multiple agents, each driving its own isolated browser session — in parallel.</em></p>
+
 ## The problem this solves
 
 The official Playwright MCP server (`@playwright/mcp`) drives a single shared browser context by default, so concurrent clients share one cookie jar, storage, and set of tabs. That is fine for one agent doing one thing, but it breaks the moment you want **parallel** work:
