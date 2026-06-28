@@ -4,7 +4,7 @@ An [MCP](https://modelcontextprotocol.io) server that runs **concurrent, session
 
 ## The problem this solves
 
-The stock Playwright MCP server multiplexes everything through a single shared browser context. That is fine for one agent doing one thing, but it breaks the moment you want **parallel** work:
+The official Playwright MCP server (`@playwright/mcp`) drives a single shared browser context by default, so concurrent clients share one cookie jar, storage, and set of tabs. That is fine for one agent doing one thing, but it breaks the moment you want **parallel** work:
 
 - Two sub-agents navigating at once stomp on each other's page, cookies, and storage.
 - A "log in as user A" flow and a "log in as user B" flow share one cookie jar, so the second login clobbers the first.
@@ -12,12 +12,22 @@ The stock Playwright MCP server multiplexes everything through a single shared b
 
 This server fixes that. Every session gets its **own** `BrowserContext` (an incognito-like profile: isolated cookies, `localStorage`, cache, and tabs) keyed by a `sessionId` you choose. Sessions share one browser process for efficiency but never share state. The headline guarantee is verified by a real-browser test and a benchmark that asserts **zero cross-session collisions**.
 
-|                      | Stock Playwright MCP | concurrent-playwright-mcp            |
-| -------------------- | -------------------- | ------------------------------------ |
-| Parallel sessions    | Shared context       | Isolated context per `sessionId`     |
-| Cookies / storage    | Shared               | Isolated per session                 |
-| Independent teardown | No                   | `browser_close_session` per session  |
-| Resource bounds      | n/a                  | Session cap + optional idle eviction |
+|                      | `@playwright/mcp` (default) | concurrent-playwright-mcp            |
+| -------------------- | --------------------------- | ------------------------------------ |
+| Parallel sessions    | Shared context              | Isolated context per `sessionId`     |
+| Cookies / storage    | Shared                      | Isolated per session                 |
+| Independent teardown | No                          | `browser_close_session` per session  |
+| Resource bounds      | n/a                         | Session cap + optional idle eviction |
+
+### Why not `@playwright/mcp --isolated`?
+
+The official server can isolate too — its `--isolated` flag gives each *connection* its own context. The difference is the model:
+
+- **Addressable sessions.** Here isolation is keyed by a `sessionId` you choose and pass to every call, so a single client can open and drive **many** isolated sessions and route each call deliberately. With `--isolated`, a "session" is just the transport connection — you can't address N parallel contexts from one client.
+- **Persistable, not ephemeral.** `--isolated` discards all state when the browser closes. Here you can `browser_save_storage_state` and restore it (`storageStatePath` on create) to resume an authenticated profile across sessions. (An upstream request for named/persistent sessions was closed as out of scope.)
+- **One lightweight context per session** — not a process or container per session — so many sessions share one Chromium.
+
+Use `@playwright/mcp` for a single browser; use this when many agents or tasks each need their own isolated, addressable session at the same time — especially over HTTP.
 
 ## Architecture
 
